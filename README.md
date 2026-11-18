@@ -29,7 +29,7 @@ sifrprobe 127.0.0.1:8899  ok=5/5
 ## install
 
 ```sh
-git clone https://github.com/sifr-salahy/sifr-probe && cd sifr-probe && make
+git clone https://github.com/Sifr-Dev/sifr-probe && cd sifr-probe && make
 ```
 
 ## build from source / test
