@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "probe.hpp"
 #include "stats.hpp"
 
 namespace {
@@ -47,47 +48,9 @@ struct ProbeResult {
     int os_error = 0;
 };
 
-struct Target {
-    std::string text;
-    std::string host;
-    std::string port;
-    bool explicit_port = false;
-};
-
-bool parse_positive(const char* text, int& value) {
-    const char* const end = text + std::strlen(text);
-    const auto result = std::from_chars(text, end, value);
-    return result.ec == std::errc{} && result.ptr == end && value > 0;
-}
-
-bool parse_target(const std::string& text, Target& target) {
-    target.text = text;
-    if (text.empty()) return false;
-
-    // A single colon separates a host and port. Literal IPv6 addresses use
-    // [address]:port; without brackets there is no unambiguous port separator.
-    const std::size_t closing = text.back() == ']' ? text.size() - 1 : text.find(']');
-    if (text.front() == '[') {
-        if (closing == std::string::npos) return false;
-        target.host = text.substr(1, closing - 1);
-        if (closing + 1 == text.size()) return !target.host.empty();
-        if (text[closing + 1] != ':') return false;
-        target.port = text.substr(closing + 2);
-        target.explicit_port = true;
-        return !target.host.empty() && !target.port.empty();
-    }
-
-    if (text.find('[') != std::string::npos || closing != std::string::npos) return false;
-    const std::size_t colon = text.rfind(':');
-    if (colon != std::string::npos && text.find(':') == colon) {
-        target.host = text.substr(0, colon);
-        target.port = text.substr(colon + 1);
-        target.explicit_port = true;
-    } else {
-        target.host = text;
-    }
-    return !target.host.empty() && !target.port.empty();
-}
+using sifrprobe::parse_positive;
+using sifrprobe::parse_target;
+using sifrprobe::Target;
 
 void print_duration(const char* label, const sifrprobe::Percentiles& stats) {
     std::printf("  %-10s min %.3f  p50 %.3f  p90 %.3f  p99 %.3f  max %.3f  mean %.3f ms\n",
@@ -100,29 +63,7 @@ void print_json_stats(const char* label, const sifrprobe::Percentiles& stats) {
                 label, stats.min, stats.p50, stats.p90, stats.p99, stats.max, stats.mean);
 }
 
-std::string json_escape(const std::string& text) {
-    std::string escaped;
-    for (const unsigned char byte : text) {
-        switch (byte) {
-            case '"': escaped += "\\\""; break;
-            case '\\': escaped += "\\\\"; break;
-            case '\b': escaped += "\\b"; break;
-            case '\f': escaped += "\\f"; break;
-            case '\n': escaped += "\\n"; break;
-            case '\r': escaped += "\\r"; break;
-            case '\t': escaped += "\\t"; break;
-            default:
-                if (byte < 0x20U) {
-                    char encoded[7];
-                    std::snprintf(encoded, sizeof encoded, "\\u%04x", byte);
-                    escaped += encoded;
-                } else {
-                    escaped += static_cast<char>(byte);
-                }
-        }
-    }
-    return escaped;
-}
+using sifrprobe::json_escape;
 
 // Wait for the socket event, without ever exceeding the remaining deadline.
 // Interrupted waits do not consume a separate timeout budget.
@@ -182,8 +123,13 @@ ProbeResult probe(const addrinfo& address, int timeout_ms, bool http,
     int connect_error = 0;
     if (connect(socket.fd, address.ai_addr, address.ai_addrlen) < 0 && errno != EINPROGRESS) {
         connect_error = errno;
-    } else if (!finish_connect(socket.fd, deadline, connect_error)) {
-        if (connect_error == 0) connect_error = ETIMEDOUT;
+        result.os_error = connect_error;
+        return result;
+    }
+    if (!finish_connect(socket.fd, deadline, connect_error)) {
+        // finish_connect() sets os_error on a real connect failure and leaves it
+        // at 0 when the deadline expired, which is the timeout case.
+        result.os_error = connect_error;
         return result;
     }
     if (connect_error != 0) {
@@ -196,8 +142,7 @@ ProbeResult probe(const addrinfo& address, int timeout_ms, bool http,
     result.connect_ms = Duration(connected - start).count();
     if (!http) return result;
 
-    const std::string request = "GET / HTTP/1.0\r\nHost: " + host +
-                                "\r\nConnection: close\r\n\r\n";
+    const std::string request = sifrprobe::http_get_request(host);
     if (!send_all(socket.fd, request, deadline)) return result;
     if (!wait_for(socket.fd, false, deadline)) return result;
 
@@ -294,17 +239,24 @@ int main(int argc, char** argv) {
         if (connected + (http ? 0 : 0) <= i && !any_address) {
             std::fprintf(stderr, "sample %d: no addresses available\n", i + 1);
         } else if (connected <= i || (http && first_byte_ok < connected)) {
-            if (last_error == ECONNREFUSED) {
-                std::fprintf(stderr, "sample %d: connection refused\n", i + 1);
-            } else if (last_error == ENETUNREACH || last_error == EHOSTUNREACH) {
-                std::fprintf(stderr, "sample %d: %s\n", i + 1,
-                             last_error == ENETUNREACH ? "network unreachable" : "host unreachable");
-            } else if (last_error == ETIMEDOUT || last_error == 0) {
-                std::fprintf(stderr, "sample %d: %s timed out after %d ms\n",
-                             i + 1, http ? "connect or first-byte" : "connect", timeout_ms);
-            } else {
-                std::fprintf(stderr, "sample %d: connect failed: %s\n",
-                             i + 1, std::strerror(last_error));
+            switch (sifrprobe::classify_connect_failure(last_error)) {
+                case sifrprobe::ConnectFailure::Refused:
+                    std::fprintf(stderr, "sample %d: connection refused\n", i + 1);
+                    break;
+                case sifrprobe::ConnectFailure::NetworkUnreachable:
+                    std::fprintf(stderr, "sample %d: network unreachable\n", i + 1);
+                    break;
+                case sifrprobe::ConnectFailure::HostUnreachable:
+                    std::fprintf(stderr, "sample %d: host unreachable\n", i + 1);
+                    break;
+                case sifrprobe::ConnectFailure::TimedOut:
+                    std::fprintf(stderr, "sample %d: %s timed out after %d ms\n",
+                                 i + 1, http ? "connect or first-byte" : "connect", timeout_ms);
+                    break;
+                case sifrprobe::ConnectFailure::Other:
+                    std::fprintf(stderr, "sample %d: connect failed: %s\n",
+                                 i + 1, std::strerror(last_error));
+                    break;
             }
         }
     }

@@ -26,6 +26,20 @@ sifrprobe 127.0.0.1:8899  ok=5/5
   first_byte min 1.488  p50 2.021  p90 5.321  p99 5.321  max 5.321  mean 2.550 ms
 ```
 
+## tests
+
+```sh
+make test           # 128 deterministic checks, no network
+make test-sanitize  # same checks under ASan + UBSan
+```
+
+The harness exercises the real logic the prober uses: percentile statistics,
+target and argument parsing, JSON escaping, HTTP/1.0 request framing, and the
+connect-failure classification. It is deterministic — fixed seed, no wall
+clock, no DNS, no external network — and the only socket activity is a refused
+loopback connect used to check that a refusal is reported as a refusal rather
+than as a timeout. CI runs both targets.
+
 ## install
 
 ```sh
