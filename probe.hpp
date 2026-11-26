@@ -91,27 +91,108 @@ inline std::string http_get_request(const std::string& host) {
     return "GET / HTTP/1.0\r\nHost: " + host + "\r\nConnection: close\r\n\r\n";
 }
 
-// A sample that never connected is reported by cause. The distinction between
-// "refused immediately" and "no answer within the deadline" is the point of the
-// diagnostic, so it is a separate pure function that tests can pin down.
-enum class ConnectFailure {
+// A failed sample is reported by the phase it failed in and the cause the
+// kernel actually delivered. A timeout is only ever the absence of an event;
+// an EOF or a reset is a real answer from the peer and must not be folded into
+// "timed out". Both the mapping and its rendering are pure functions so tests
+// can pin them down without a socket.
+enum class Phase {
+    Connect,
+    Send,
+    FirstByte,
+};
+
+enum class FailureCause {
+    None,
     Refused,
     NetworkUnreachable,
     HostUnreachable,
+    ConnectionReset,
+    PeerClosed,
     TimedOut,
     Other,
 };
 
-inline ConnectFailure classify_connect_failure(int os_error) {
+inline FailureCause classify_socket_error(int os_error) {
     switch (os_error) {
-        case ECONNREFUSED: return ConnectFailure::Refused;
-        case ENETUNREACH: return ConnectFailure::NetworkUnreachable;
-        case EHOSTUNREACH: return ConnectFailure::HostUnreachable;
-        // 0 means the deadline expired without a connect error being set.
-        case 0:
-        case ETIMEDOUT: return ConnectFailure::TimedOut;
-        default: return ConnectFailure::Other;
+        case ECONNREFUSED: return FailureCause::Refused;
+        case ENETUNREACH: return FailureCause::NetworkUnreachable;
+        case EHOSTUNREACH: return FailureCause::HostUnreachable;
+        case ECONNRESET:
+        case EPIPE: return FailureCause::ConnectionReset;
+        case ETIMEDOUT: return FailureCause::TimedOut;
+        default: return FailureCause::Other;
     }
+}
+
+// Maps a real connect errno to a cause. There is deliberately no "errno 0 means
+// timed out" rule: zero is not an error, and treating it as a timeout is the
+// exact sentinel that used to make a peer close look like a deadline expiry.
+// A timeout is set by the caller that observed the deadline expire, never
+// inferred from a missing error.
+inline FailureCause classify_connect_failure(int os_error) {
+    if (os_error == 0) return FailureCause::None;
+    return classify_socket_error(os_error);
+}
+
+// recv() == 0 means the peer closed cleanly after the request was sent: that
+// is a definite response, not a timeout. A non-zero errno is the kernel's
+// verdict on the connection.
+inline FailureCause classify_first_byte_failure(int os_error, bool peer_closed) {
+    if (peer_closed) return FailureCause::PeerClosed;
+    if (os_error == 0) return FailureCause::Other;
+    return classify_socket_error(os_error);
+}
+
+inline const char* failure_cause_key(FailureCause cause) {
+    switch (cause) {
+        case FailureCause::None: return "none";
+        case FailureCause::Refused: return "refused";
+        case FailureCause::NetworkUnreachable: return "network_unreachable";
+        case FailureCause::HostUnreachable: return "host_unreachable";
+        case FailureCause::ConnectionReset: return "connection_reset";
+        case FailureCause::PeerClosed: return "peer_closed";
+        case FailureCause::TimedOut: return "timed_out";
+        case FailureCause::Other: return "other";
+    }
+    return "other";
+}
+
+inline std::string describe_failure(Phase phase, FailureCause cause, int os_error,
+                                    int timeout_ms) {
+    if (cause == FailureCause::None) return {};
+    const std::string after = std::to_string(timeout_ms) + " ms";
+    if (phase == Phase::Connect) {
+        switch (cause) {
+            case FailureCause::Refused: return "connection refused";
+            case FailureCause::NetworkUnreachable: return "network unreachable";
+            case FailureCause::HostUnreachable: return "host unreachable";
+            case FailureCause::ConnectionReset: return "connection reset while connecting";
+            case FailureCause::TimedOut: return "connect timed out after " + after;
+            case FailureCause::PeerClosed: return "connection closed by peer while connecting";
+            case FailureCause::Other:
+                return "connect failed: " +
+                       (os_error != 0 ? std::strerror(os_error) : std::string("unknown error"));
+            case FailureCause::None: break;
+        }
+    }
+    switch (cause) {
+        case FailureCause::PeerClosed: return "connection closed by peer before first byte";
+        case FailureCause::ConnectionReset: return "connection reset by peer before first byte";
+        case FailureCause::TimedOut:
+            return (phase == Phase::Send ? "request send timed out after "
+                                         : "first byte timed out after ") +
+                   after;
+        case FailureCause::Refused: return "connection refused before first byte";
+        case FailureCause::NetworkUnreachable: return "network unreachable before first byte";
+        case FailureCause::HostUnreachable: return "host unreachable before first byte";
+        case FailureCause::Other:
+            return std::string(phase == Phase::Send ? "request send failed: "
+                                                    : "first byte failed: ") +
+                   (os_error != 0 ? std::strerror(os_error) : std::string("unknown error"));
+        case FailureCause::None: break;
+    }
+    return {};
 }
 
 }  // namespace sifrprobe
