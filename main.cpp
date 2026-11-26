@@ -43,8 +43,12 @@ struct ProbeResult {
     bool received_first_byte = false;
     double connect_ms = 0.0;
     double first_byte_ms = 0.0;
-    // errno from the connect attempt, or 0 for a clean timeout. Distinguishing
-    // "refused in 0.02 ms" from "no answer in 2000 ms" matters for diagnostics.
+    // The phase the sample failed in (meaningful only when ok is false) and the
+    // cause the kernel or the peer actually delivered. Distinguishing
+    // "refused in 0.02 ms" from "no answer in 2000 ms" — and a peer close from
+    // a deadline expiry — is the point of the diagnostic.
+    sifrprobe::Phase failed_phase = sifrprobe::Phase::Connect;
+    sifrprobe::FailureCause cause = sifrprobe::FailureCause::None;
     int os_error = 0;
 };
 
@@ -65,12 +69,20 @@ void print_json_stats(const char* label, const sifrprobe::Percentiles& stats) {
 
 using sifrprobe::json_escape;
 
+// Outcome of waiting for a socket event. A deadline expiry and a real select()
+// failure are different facts: only the former is a timeout.
+enum class WaitStatus {
+    Ready,
+    TimedOut,
+    Failed,
+};
+
 // Wait for the socket event, without ever exceeding the remaining deadline.
 // Interrupted waits do not consume a separate timeout budget.
-bool wait_for(int fd, bool writing, Clock::time_point deadline) {
+WaitStatus wait_for(int fd, bool writing, Clock::time_point deadline) {
     for (;;) {
         const auto now = Clock::now();
-        if (now >= deadline) return false;
+        if (now >= deadline) return WaitStatus::TimedOut;
         const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
         const auto microseconds = std::max<std::chrono::microseconds::rep>(1, remaining.count());
         timeval timeout{
@@ -82,28 +94,79 @@ bool wait_for(int fd, bool writing, Clock::time_point deadline) {
         FD_SET(fd, &fds);
         const int rc = select(fd + 1, writing ? nullptr : &fds,
                               writing ? &fds : nullptr, nullptr, &timeout);
-        if (rc > 0) return true;
-        if (rc == 0) return false;
-        if (errno != EINTR) return false;
+        if (rc > 0) return WaitStatus::Ready;
+        if (rc == 0) return WaitStatus::TimedOut;
+        if (errno != EINTR) return WaitStatus::Failed;
     }
 }
 
-bool finish_connect(int fd, Clock::time_point deadline, int& os_error) {
-    if (!wait_for(fd, true, deadline)) return false;  // timeout; os_error stays 0
-    socklen_t length = sizeof os_error;
-    return getsockopt(fd, SOL_SOCKET, SO_ERROR, &os_error, &length) == 0 && os_error == 0;
+// A negative return from connect() only means "in progress" for EINPROGRESS
+// (and its platform aliases). Anything else is a definite connect failure and
+// must not be retried through SO_ERROR, which would report 0 and be misread as
+// a timeout.
+bool connect_in_progress(int error) {
+    return error == EINPROGRESS || error == EWOULDBLOCK || error == EALREADY;
 }
 
-bool send_all(int fd, const std::string& data, Clock::time_point deadline) {
+// Returns true when the connect completed successfully. On failure, fills the
+// phase/cause the sample ended with.
+bool finish_connect(int fd, Clock::time_point deadline, ProbeResult& result) {
+    const WaitStatus status = wait_for(fd, true, deadline);
+    if (status == WaitStatus::TimedOut) {
+        result.failed_phase = sifrprobe::Phase::Connect;
+        result.cause = sifrprobe::FailureCause::TimedOut;
+        return false;
+    }
+    if (status == WaitStatus::Failed) {
+        result.failed_phase = sifrprobe::Phase::Connect;
+        result.os_error = errno;
+        result.cause = sifrprobe::classify_connect_failure(errno);
+        return false;
+    }
+    int socket_error = 0;
+    socklen_t length = sizeof socket_error;
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &length) != 0) {
+        result.failed_phase = sifrprobe::Phase::Connect;
+        result.os_error = errno;
+        result.cause = sifrprobe::classify_connect_failure(errno);
+        return false;
+    }
+    if (socket_error != 0) {
+        result.failed_phase = sifrprobe::Phase::Connect;
+        result.os_error = socket_error;
+        result.cause = sifrprobe::classify_connect_failure(socket_error);
+        return false;
+    }
+    return true;
+}
+
+bool send_all(int fd, const std::string& data, Clock::time_point deadline,
+              ProbeResult& result) {
     std::size_t offset = 0;
     while (offset < data.size()) {
-        if (!wait_for(fd, true, deadline)) return false;
+        const WaitStatus status = wait_for(fd, true, deadline);
+        if (status == WaitStatus::TimedOut) {
+            result.failed_phase = sifrprobe::Phase::Send;
+            result.cause = sifrprobe::FailureCause::TimedOut;
+            return false;
+        }
+        if (status == WaitStatus::Failed) {
+            result.failed_phase = sifrprobe::Phase::Send;
+            result.os_error = errno;
+            result.cause = sifrprobe::classify_socket_error(errno);
+            return false;
+        }
         const ssize_t sent = send(fd, data.data() + offset, data.size() - offset, MSG_NOSIGNAL);
         if (sent > 0) {
             offset += static_cast<std::size_t>(sent);
         } else if (sent < 0 && errno == EINTR) {
             continue;
+        } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            continue;  // spurious writability; wait_for() re-checks the deadline
         } else {
+            result.failed_phase = sifrprobe::Phase::Send;
+            result.os_error = sent == 0 ? 0 : errno;
+            result.cause = sifrprobe::classify_socket_error(result.os_error);
             return false;
         }
     }
@@ -116,26 +179,29 @@ ProbeResult probe(const addrinfo& address, int timeout_ms, bool http,
                   const std::string& host) {
     ProbeResult result;
     Socket socket{::socket(address.ai_family, address.ai_socktype, address.ai_protocol)};
-    if (socket.fd < 0 || !set_nonblocking(socket.fd)) return result;
+    if (socket.fd < 0) {
+        result.failed_phase = sifrprobe::Phase::Connect;
+        result.os_error = errno;
+        result.cause = sifrprobe::classify_socket_error(errno);
+        return result;
+    }
+    if (!set_nonblocking(socket.fd)) {
+        result.failed_phase = sifrprobe::Phase::Connect;
+        result.os_error = errno;
+        result.cause = sifrprobe::classify_socket_error(errno);
+        return result;
+    }
 
     const auto start = Clock::now();
     const auto deadline = start + std::chrono::milliseconds(timeout_ms);
-    int connect_error = 0;
-    if (connect(socket.fd, address.ai_addr, address.ai_addrlen) < 0 && errno != EINPROGRESS) {
-        connect_error = errno;
-        result.os_error = connect_error;
+    if (connect(socket.fd, address.ai_addr, address.ai_addrlen) < 0 &&
+        !connect_in_progress(errno)) {
+        result.failed_phase = sifrprobe::Phase::Connect;
+        result.os_error = errno;
+        result.cause = sifrprobe::classify_connect_failure(errno);
         return result;
     }
-    if (!finish_connect(socket.fd, deadline, connect_error)) {
-        // finish_connect() sets os_error on a real connect failure and leaves it
-        // at 0 when the deadline expired, which is the timeout case.
-        result.os_error = connect_error;
-        return result;
-    }
-    if (connect_error != 0) {
-        result.os_error = connect_error;
-        return result;
-    }
+    if (!finish_connect(socket.fd, deadline, result)) return result;
 
     const auto connected = Clock::now();
     result.connected = true;
@@ -143,25 +209,41 @@ ProbeResult probe(const addrinfo& address, int timeout_ms, bool http,
     if (!http) return result;
 
     const std::string request = sifrprobe::http_get_request(host);
-    if (!send_all(socket.fd, request, deadline)) return result;
-    if (!wait_for(socket.fd, false, deadline)) return result;
+    if (!send_all(socket.fd, request, deadline, result)) return result;
 
-    char byte;
-    const ssize_t received = recv(socket.fd, &byte, 1, 0);
-    if (received > 0) {
-        result.received_first_byte = true;
-        result.first_byte_ms = Duration(Clock::now() - connected).count();
-    } else if (received < 0 && errno == EINTR) {
-        // Rare, but a signal must not turn a connected socket into a fake sample.
-        if (wait_for(socket.fd, false, deadline)) {
-            const ssize_t retry = recv(socket.fd, &byte, 1, 0);
-            if (retry > 0) {
-                result.received_first_byte = true;
-                result.first_byte_ms = Duration(Clock::now() - connected).count();
-            }
+    for (;;) {
+        const WaitStatus status = wait_for(socket.fd, false, deadline);
+        if (status == WaitStatus::TimedOut) {
+            result.failed_phase = sifrprobe::Phase::FirstByte;
+            result.cause = sifrprobe::FailureCause::TimedOut;
+            return result;
         }
+        if (status == WaitStatus::Failed) {
+            result.failed_phase = sifrprobe::Phase::FirstByte;
+            result.os_error = errno;
+            result.cause = sifrprobe::classify_first_byte_failure(errno, false);
+            return result;
+        }
+        char byte;
+        const ssize_t received = recv(socket.fd, &byte, 1, 0);
+        if (received > 0) {
+            result.received_first_byte = true;
+            result.first_byte_ms = Duration(Clock::now() - connected).count();
+            return result;
+        }
+        if (received == 0) {
+            // A clean FIN before any byte is a peer decision, not a deadline expiry.
+            result.failed_phase = sifrprobe::Phase::FirstByte;
+            result.cause = sifrprobe::FailureCause::PeerClosed;
+            return result;
+        }
+        if (errno == EINTR) continue;  // a signal must not fake a sample failure
+        if (errno == EAGAIN || errno == EWOULDBLOCK) continue;  // wait_for() re-checks the deadline
+        result.failed_phase = sifrprobe::Phase::FirstByte;
+        result.os_error = errno;
+        result.cause = sifrprobe::classify_first_byte_failure(errno, false);
+        return result;
     }
-    return result;
 }
 
 }  // namespace
@@ -219,45 +301,46 @@ int main(int argc, char** argv) {
     int connected = 0;
     int first_byte_ok = 0;
     for (int i = 0; i < count; ++i) {
-        bool any_address = false;
-        int last_error = 0;
+        // Each sample is judged on its own outcome. Cumulative counters must
+        // never decide whether *this* sample failed: once one sample fails,
+        // comparing running totals to the index would blame every later,
+        // successful sample too.
+        ProbeResult sample;
+        bool attempted = false;
         for (const addrinfo* address = addresses; address != nullptr; address = address->ai_next) {
-            any_address = true;
-            const ProbeResult sample = probe(*address, timeout_ms, http, target.host);
-            if (!sample.connected) {
-                last_error = sample.os_error;
-                continue;
-            }
-            connects.push_back(sample.connect_ms);
-            ++connected;
-            if (sample.received_first_byte) {
-                first_bytes.push_back(sample.first_byte_ms);
-                ++first_byte_ok;
-            }
-            break;
+            attempted = true;
+            sample = probe(*address, timeout_ms, http, target.host);
+            if (sample.connected) break;  // one address per sample, as before
         }
-        if (connected + (http ? 0 : 0) <= i && !any_address) {
+        if (!attempted) {
             std::fprintf(stderr, "sample %d: no addresses available\n", i + 1);
-        } else if (connected <= i || (http && first_byte_ok < connected)) {
-            switch (sifrprobe::classify_connect_failure(last_error)) {
-                case sifrprobe::ConnectFailure::Refused:
-                    std::fprintf(stderr, "sample %d: connection refused\n", i + 1);
-                    break;
-                case sifrprobe::ConnectFailure::NetworkUnreachable:
-                    std::fprintf(stderr, "sample %d: network unreachable\n", i + 1);
-                    break;
-                case sifrprobe::ConnectFailure::HostUnreachable:
-                    std::fprintf(stderr, "sample %d: host unreachable\n", i + 1);
-                    break;
-                case sifrprobe::ConnectFailure::TimedOut:
-                    std::fprintf(stderr, "sample %d: %s timed out after %d ms\n",
-                                 i + 1, http ? "connect or first-byte" : "connect", timeout_ms);
-                    break;
-                case sifrprobe::ConnectFailure::Other:
-                    std::fprintf(stderr, "sample %d: connect failed: %s\n",
-                                 i + 1, std::strerror(last_error));
-                    break;
-            }
+            continue;
+        }
+        if (!sample.connected) {
+            // Every failure path sets a cause; fall back to a named cause rather
+            // than printing an empty diagnostic if one is ever missed.
+            const auto cause = sample.cause == sifrprobe::FailureCause::None
+                                   ? sifrprobe::FailureCause::Other
+                                   : sample.cause;
+            std::fprintf(stderr, "sample %d: %s\n", i + 1,
+                         sifrprobe::describe_failure(sample.failed_phase, cause,
+                                                     sample.os_error, timeout_ms)
+                             .c_str());
+            continue;
+        }
+        connects.push_back(sample.connect_ms);
+        ++connected;
+        if (sample.received_first_byte) {
+            first_bytes.push_back(sample.first_byte_ms);
+            ++first_byte_ok;
+        } else if (http) {
+            const auto cause = sample.cause == sifrprobe::FailureCause::None
+                                   ? sifrprobe::FailureCause::Other
+                                   : sample.cause;
+            std::fprintf(stderr, "sample %d: %s\n", i + 1,
+                         sifrprobe::describe_failure(sample.failed_phase, cause,
+                                                     sample.os_error, timeout_ms)
+                             .c_str());
         }
     }
     freeaddrinfo(addresses);

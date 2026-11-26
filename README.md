@@ -29,16 +29,34 @@ sifrprobe 127.0.0.1:8899  ok=5/5
 ## tests
 
 ```sh
-make test           # 128 deterministic checks, no network
+make test           # 193 deterministic checks
 make test-sanitize  # same checks under ASan + UBSan
 ```
 
 The harness exercises the real logic the prober uses: percentile statistics,
 target and argument parsing, JSON escaping, HTTP/1.0 request framing, and the
-connect-failure classification. It is deterministic — fixed seed, no wall
-clock, no DNS, no external network — and the only socket activity is a refused
-loopback connect used to check that a refusal is reported as a refusal rather
-than as a timeout. CI runs both targets.
+phase/cause failure classification. It is deterministic — fixed seed, no wall
+clock, no DNS, no external network. CI runs both targets.
+
+Most checks are pure and network-free. The diagnostics checks drive the real
+binary over a real kernel socket on `127.0.0.1`, using a fork-based fixture
+server on an ephemeral port: a peer FIN, an abortive close (RST), a FIN after
+the request, a one-byte answer, and a peer that stays silent past the deadline.
+Those cases are what prove the prober reports *what actually happened* rather
+than folding every post-connect failure into "timed out".
+
+## diagnostics
+
+A failed sample names the phase it failed in and the cause, e.g.
+`sample 1: connection closed by peer before first byte`,
+`sample 1: connection reset by peer before first byte`,
+`sample 1: first byte timed out after 250 ms`, or
+`sample 1: connection refused`.
+
+A deadline expiry and a peer that closed or reset are deliberately distinct: a
+timeout means nothing arrived before the deadline, while a close or reset is a
+definite answer from the network. Only the failing sample is reported.
+
 
 ## install
 
