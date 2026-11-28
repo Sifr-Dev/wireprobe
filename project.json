@@ -1,0 +1,10 @@
+{
+  "name": "wireprobe",
+  "description": "Network wire-protocol probe",
+  "stack": [
+    "make",
+    "make"
+  ],
+  "status": "active",
+  "primary_language": "C++"
+}
